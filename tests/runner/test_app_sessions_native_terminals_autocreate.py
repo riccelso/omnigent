@@ -3357,6 +3357,35 @@ class _CodexSnapshotServerClient:
         return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
 
 
+class _BlockingCodexRecoveryServerClient:
+    """Block durable inbox recovery while rejecting redundant init reads."""
+
+    def __init__(self) -> None:
+        self.recovery_started = asyncio.Event()
+        self.release_recovery = asyncio.Event()
+        self.requests: list[str] = []
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Serve recovery/history reads and fail any session metadata callback."""
+        del kwargs
+        self.requests.append(url)
+        if url.endswith("/child_sessions"):
+            self.recovery_started.set()
+            await self.release_recovery.wait()
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False},
+                request=httpx.Request("GET", url),
+            )
+        if url.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False},
+                request=httpx.Request("GET", url),
+            )
+        raise AssertionError(f"unexpected runner-init GET: {url}")
+
+
 _CODEX_AUTO_CREATE_SCENARIOS = [
     # Rotation target: the bridge's active session still owns the live codex
     # terminal that is about to be transferred onto the new session.
@@ -3530,6 +3559,96 @@ async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
         # is the regression: it 409s the transfer, so the terminal and its tmux
         # status link stay on the superseded session.
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
+
+
+@pytest.mark.asyncio
+async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protocol-v2 metadata and inbox recovery stay off terminal startup's critical path."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
+        tmp_path / "codex-native",
+    )
+    terminal_started = asyncio.Event()
+
+    async def _recording_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **_kwargs: Any,
+    ) -> None:
+        del session_id, resource_registry, publish_event
+        terminal_started.set()
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _recording_auto_create,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "f1a92609dd7840ae9f2c4c29127c2a61"
+    agent_id = "7d594e9075c74249a846df420dfa7fcb"
+    server_client = _BlockingCodexRecoveryServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "0.13.0.dev5",
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "snapshot": {
+                            "created_at": 10,
+                            "updated_at": 11,
+                            "workspace": str(tmp_path),
+                            "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+                        },
+                    },
+                },
+            )
+        )
+        recovery_wait = asyncio.create_task(server_client.recovery_started.wait())
+        done, _ = await asyncio.wait(
+            {request_task, recovery_wait},
+            timeout=1.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert recovery_wait in done, (
+            f"session init finished before recovery started: "
+            f"{request_task.result().status_code} {request_task.result().text}"
+        )
+        await asyncio.wait_for(terminal_started.wait(), timeout=1.0)
+        assert not request_task.done()
+        server_client.release_recovery.set()
+        resp = await request_task
+
+    assert resp.status_code == 201, resp.text
+    assert server_client.requests == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/items",
+    ]
 
 
 @pytest.mark.asyncio

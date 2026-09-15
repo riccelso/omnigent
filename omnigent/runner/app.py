@@ -3964,8 +3964,14 @@ def create_runner_app(
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
         # A fresh queue can mean a fresh runner process rather than a fresh
-        # session: re-queue results the previous process never drained.
-        await _recover_undrained_subagent_results(session_id)
+        # session: re-queue results the previous process never drained. Start
+        # the durable server scan now, but overlap it with terminal creation;
+        # sys_read_inbox uses the same locked helper if a turn races the scan.
+        _deliver_retained_subagent_results(session_id)
+        _subagent_recovery_task = asyncio.create_task(
+            _recover_undrained_subagent_results(session_id),
+            name=f"subagent-recovery:{session_id}",
+        )
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -4103,12 +4109,16 @@ def create_runner_app(
             elif harness_name == "codex-native":
 
                 async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
-                    needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    needs = (
+                        init_context.envelope is not None
+                        or await _codex_session_needs_runner_terminal(server_client, session_id)
+                    )
                     if not has_terminal:
                         inbound = await _codex_native_terminal_arrives_via_transfer(
                             server_client=server_client,
                             session_id=session_id,
                             resource_registry=resource_registry,
+                            session_labels=init_context.labels,
                         )
                         _logger.info(
                             "Codex terminal transfer-inbound check: session=%s "
@@ -4263,6 +4273,11 @@ def create_runner_app(
                         )
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
+
+        # Preserve the initialization contract: undrained child results are
+        # recovered before POST /sessions returns. The scan no longer delays
+        # native terminal registration because it ran concurrently above.
+        await _subagent_recovery_task
 
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
